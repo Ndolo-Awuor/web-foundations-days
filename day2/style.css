@@ -146,6 +146,11 @@ th {
   color: #203f70;
 }
 
+th:first-child,
+td:first-child {
+  white-space: nowrap;
+}
+
 tbody tr:nth-child(even) {
   background-color: #f8fafd;
 }
