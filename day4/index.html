@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QuickNotes — Live Character Counter</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="script.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <p class="brand">QuickNotes</p>
+      <button id="theme-toggle" type="button">Dark mode</button>
+    </header>
+
+    <main>
+      <h1>Live Character Counter</h1>
+      <p class="intro">Watch your character and word counts as you write.</p>
+
+      <section class="editor" aria-labelledby="draft-heading">
+        <h2 id="draft-heading">Your draft</h2>
+        <label for="note-text">Note text</label>
+        <!-- Allow more than 200 characters so the over-limit style can appear. -->
+        <textarea
+          id="note-text"
+          rows="8"
+          placeholder="Write down an idea..."
+          aria-describedby="char-count word-count note-hint"
+        ></textarea>
+
+        <div class="counters" aria-live="polite" aria-atomic="true">
+          <p id="char-count">0 / 200 characters</p>
+          <p id="word-count">0 words</p>
+        </div>
+
+        <div class="editor-actions">
+          <button id="clear-btn" class="secondary" type="button">Clear</button>
+          <p id="note-hint">Aim for 200 characters. Press Escape to clear.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <p>Your draft and theme are saved automatically in this browser.</p>
+    </footer>
+  </body>
+</html>
