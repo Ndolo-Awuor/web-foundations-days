@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>User Directory</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="users.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <h1>User Directory</h1>
+      <p>Load a directory of sample users and find someone by name.</p>
+    </header>
+
+    <main>
+      <section aria-labelledby="directory-heading">
+        <h2 id="directory-heading">Find a user</h2>
+        <button id="load-users" type="button">Load users</button>
+
+        <div class="filter-field">
+          <label for="filter-input">Filter by name</label>
+          <input
+            id="filter-input"
+            type="search"
+            placeholder="For example, Leanne"
+            aria-describedby="filter-hint"
+          />
+          <p id="filter-hint">Filtering searches the users already loaded.</p>
+        </div>
+
+        <p id="status" role="status" aria-live="polite" aria-atomic="true">
+          Click Load users to get started.
+        </p>
+        <ul id="users-list" aria-label="Users"></ul>
+      </section>
+    </main>
+
+    <footer>
+      <p>Sample user data from JSONPlaceholder · Day 5 assignment</p>
+    </footer>
+  </body>
+</html>

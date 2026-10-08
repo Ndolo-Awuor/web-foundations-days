@@ -1,0 +1,185 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background-color: #f3f6fa;
+  color: #25344a;
+  font-family: "Segoe UI", Arial, sans-serif;
+  line-height: 1.6;
+}
+
+header {
+  padding: 36px 24px;
+  background-color: #203f70;
+  color: #ffffff;
+  text-align: center;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 2.5rem;
+  line-height: 1.2;
+}
+
+header p {
+  margin: 12px 0 0;
+}
+
+main {
+  max-width: 900px;
+  margin: 32px auto;
+  padding: 0 24px;
+}
+
+section {
+  padding: 28px;
+  border: 1px solid #dce4ee;
+  border-radius: 12px;
+  background-color: #ffffff;
+}
+
+h2 {
+  margin: 0 0 20px;
+  color: #203f70;
+}
+
+button {
+  padding: 12px 22px;
+  border: 0;
+  border-radius: 8px;
+  background-color: #285797;
+  color: #ffffff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 180ms ease;
+}
+
+button:hover:not(:disabled) {
+  background-color: #203f70;
+}
+
+button:disabled {
+  background-color: #52627a;
+  cursor: wait;
+}
+
+.filter-field {
+  margin-top: 24px;
+}
+
+label {
+  display: block;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+input {
+  width: 100%;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid #8190a5;
+  border-radius: 8px;
+  color: #25344a;
+  font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 3px solid #c06b00;
+  outline-offset: 3px;
+}
+
+#filter-hint,
+footer {
+  color: #52627a;
+  font-size: 0.9rem;
+}
+
+#filter-hint {
+  margin: 8px 0 0;
+}
+
+#status {
+  margin: 24px 0 16px;
+}
+
+#status.success {
+  color: #17654a;
+}
+
+#status.error {
+  color: #b42318;
+  font-weight: 600;
+}
+
+#users-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  gap: 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.user-card {
+  padding: 20px;
+  border: 1px solid #d5e2f2;
+  border-radius: 8px;
+  background-color: #f8fafd;
+  overflow-wrap: anywhere;
+}
+
+.user-card h3 {
+  margin: 0 0 12px;
+  color: #203f70;
+}
+
+.user-card p {
+  margin: 6px 0;
+}
+
+.empty-message {
+  grid-column: 1 / -1;
+  padding: 16px;
+  border-radius: 8px;
+  background-color: #edf3fb;
+}
+
+footer {
+  padding: 0 24px 24px;
+  text-align: center;
+}
+
+@media (max-width: 600px) {
+  header {
+    padding: 28px 16px;
+  }
+
+  header h1 {
+    font-size: 2rem;
+  }
+
+  main {
+    margin: 24px auto;
+    padding: 0 16px;
+  }
+
+  section {
+    padding: 20px;
+  }
+
+  button {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button {
+    transition: none;
+  }
+}
