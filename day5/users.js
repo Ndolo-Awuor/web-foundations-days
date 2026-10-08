@@ -5,6 +5,20 @@ const status = document.querySelector("#status");
 const usersList = document.querySelector("#users-list");
 
 const USERS_URL = "https://jsonplaceholder.typicode.com/users";
+// Custom names for the API's ten sample profiles, matched by user ID.
+const USER_NAMES = {
+  1: "Judith Kerubo",
+  2: "Peter Onyango",
+  3: "Mike Ndolo",
+  4: "Zipporah Kwamboka",
+  5: "George Atambo",
+  6: "Thomas Mosomi",
+  7: "David Onchere",
+  8: "George Moochi",
+  9: "Chebet Vanessa",
+  10: "Atogo Michael",
+};
+
 let users = [];
 let hasLoaded = false;
 let isLoading = false;
@@ -84,7 +98,11 @@ async function loadUsers() {
       throw new Error("The server did not return a user list.");
     }
 
-    users = data;
+    // Keep the API details and replace only the sample names locally.
+    users = data.map((user) => ({
+      ...user,
+      name: USER_NAMES[user.id] ?? user.name,
+    }));
     hasLoaded = true;
   } catch (error) {
     users = [];
