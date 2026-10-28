@@ -5,6 +5,12 @@ uses six parts: requirements, estimates, API, data model, architecture and
 trade-offs. **A database transaction decides who owns a seat; a cached seat map
 or a successful browser redirect never proves that a ticket was bought.**
 
+**Review update:** the implementation detail requested in feedback is below:
+[full schema and foreign keys](#41-executable-postgresql-schema),
+[exact locking transaction and two-session test](#42-exact-hold-transaction), and
+[architecture diagram](#51-architecture-diagram). All six design parts remain
+in this single file; the reflection is the separate reflection.md file.
+
 ## 1. Requirements
 
 ### Functional
@@ -136,80 +142,293 @@ An empty ticket list is 200 with `tickets: []`; 204 has no response body.
 
 ## 4. Data model and prevention of double-booking
 
-Use a relational database such as PostgreSQL for transactions, ownership and
-uniqueness. IDs are generated; timestamps are UTC; money is an integer number
-of currency minor units, never a floating-point value.
+Use PostgreSQL transactions and constraints for authoritative inventory. IDs are
+allocated by the backend, timestamps are UTC, and prices are integer minor units.
+Users have many orders; events have many seats and orders; one seat has many
+historical orders but at most one active claim. Each order has at most one
+payment and one ticket. Users and events are many-to-many through orders.
 
-| Table | Main columns and rules |
-| --- | --- |
-| users | `id BIGINT PK`, `name TEXT NOT NULL`, `email TEXT UNIQUE NOT NULL`, `auth_subject TEXT UNIQUE NOT NULL`. |
-| events | `id BIGINT PK`, `title TEXT`, `venue TEXT`, `starts_at TIMESTAMPTZ`, `sale_opens_at TIMESTAMPTZ`, `status TEXT`; required event fields are NOT NULL. |
-| seats | `id BIGINT PK`, `event_id FK events`, `section TEXT`, `seat_number TEXT`, `price_minor BIGINT CHECK >= 0`, `currency CHAR(3)`, `state TEXT`, nullable `current_order_id FK orders`, nullable `hold_expires_at TIMESTAMPTZ`; `UNIQUE(event_id, section, seat_number)` and `UNIQUE(id, event_id)`. |
-| orders | `id TEXT PK` (opaque generated ID), `user_id FK users`, `event_id FK events`, `seat_id BIGINT`, `status TEXT`, immutable `amount_minor BIGINT` and `currency CHAR(3)`, `request_key TEXT`, `request_hash TEXT`, `hold_expires_at TIMESTAMPTZ`, `initial_response JSONB`, `created_at TIMESTAMPTZ`; `UNIQUE(user_id, request_key)` and composite FK `(seat_id, event_id) -> seats(id, event_id)`. |
-| payments | `id TEXT PK`, `order_id UNIQUE FK orders`, nullable unique `provider_reference TEXT`, `status TEXT`, `amount_minor BIGINT`, `currency CHAR(3)`, `updated_at TIMESTAMPTZ`; one logical payment per order. |
-| tickets | `id TEXT PK`, `order_id UNIQUE FK orders`, `seat_id UNIQUE FK seats`, `user_id FK users`, `qr_token_hash TEXT UNIQUE`, `issued_at TIMESTAMPTZ`; seat/user must match the paid order. |
+### 4.1 Executable PostgreSQL schema
 
-All identifiers and core fields are NOT NULL except the nullable fields named
-above. Add the seat-to-order FK after creating orders because it is a circular
-reference. A composite FK from tickets `(order_id, seat_id, user_id)` to a unique
-orders `(id, seat_id, user_id)` key enforces the ticket/order match. Use CHECK
-constraints for permitted states and non-negative amounts. AVAILABLE seats have
-no current order/deadline; HELD seats require both; PAYMENT_PENDING and SOLD
-seats require their current order. Store the original hold response and deadline
-on the order so an idempotent replay does not renew an expired reservation.
-
-Relationships: users have many orders; events have many seats and orders; one
-seat has many **historical** orders but at most one live claim; one order has at
-most one payment and one ticket. Users and events are many-to-many through
-orders. A ticket remains associated with its sold seat; refunds do not return
-inventory for resale in this version.
-
-Operational tables: `webhook_events(provider_event_id PK, payload, processed_at)`
-deduplicates callbacks; `outbox(id PK, type, order_id FK orders, published_at)`
-records work in the same transaction as a business change. A separate durable
-waiting-room ledger has `UNIQUE(event_id, user_id)` and an admission position.
-
-Two production constraints provide a second defence beyond application code:
+Run these CREATE statements once in a fresh PostgreSQL database, in this order.
+The six domain tables include explicit primary keys, foreign keys, state checks
+and uniqueness. The two operational tables support durable callbacks/outbox
+publication. A separately managed waiting-room ledger enforces one queue entry
+per user/event. These statements are PostgreSQL SQL, not SQLite SQL.
 
 ```sql
-CREATE UNIQUE INDEX one_live_order_per_seat
-ON orders(seat_id)
-WHERE status IN ('HELD', 'PAYMENT_PENDING', 'PAID');
-
-CREATE UNIQUE INDEX one_live_order_per_user_event
-ON orders(user_id, event_id)
-WHERE status IN ('HELD', 'PAYMENT_PENDING', 'PAID');
+CREATE TABLE users (
+  id BIGINT PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT NOT NULL UNIQUE,
+  auth_subject TEXT NOT NULL UNIQUE
+);
+CREATE TABLE events (
+  id BIGINT PRIMARY KEY,
+  title TEXT NOT NULL, venue TEXT NOT NULL,
+  starts_at TIMESTAMPTZ NOT NULL,
+  sale_opens_at TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('SCHEDULED','OPEN','SOLD_OUT','CANCELLED')),
+  CHECK (starts_at > sale_opens_at)
+);
+CREATE TABLE seats (
+  id BIGINT PRIMARY KEY,
+  event_id BIGINT NOT NULL REFERENCES events(id),
+  section TEXT NOT NULL, seat_number TEXT NOT NULL,
+  price_minor BIGINT NOT NULL CHECK (price_minor >= 0),
+  currency CHAR(3) NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('AVAILABLE','HELD','PAYMENT_PENDING','SOLD')),
+  current_order_id TEXT,
+  hold_expires_at TIMESTAMPTZ,
+  UNIQUE (event_id, section, seat_number),
+  UNIQUE (id, event_id),
+  CHECK (
+    (state = 'AVAILABLE' AND current_order_id IS NULL AND hold_expires_at IS NULL) OR
+    (state = 'HELD' AND current_order_id IS NOT NULL AND hold_expires_at IS NOT NULL) OR
+    (state IN ('PAYMENT_PENDING','SOLD') AND current_order_id IS NOT NULL AND hold_expires_at IS NULL)
+  )
+);
+CREATE TABLE orders (
+  id TEXT PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id),
+  event_id BIGINT NOT NULL REFERENCES events(id),
+  seat_id BIGINT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN
+    ('HELD','PAYMENT_PENDING','PAID','EXPIRED','CANCELLED','FAILED','REFUND_REQUIRED')),
+  amount_minor BIGINT NOT NULL CHECK (amount_minor >= 0),
+  currency CHAR(3) NOT NULL,
+  request_key TEXT NOT NULL, request_hash TEXT NOT NULL,
+  hold_expires_at TIMESTAMPTZ NOT NULL,
+  initial_response JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  FOREIGN KEY (seat_id, event_id) REFERENCES seats(id, event_id),
+  UNIQUE (user_id, request_key),
+  UNIQUE (id, seat_id, user_id),
+  UNIQUE (id, seat_id, event_id)
+);
+-- Added after orders exists; this also checks that the order owns THIS seat/event.
+ALTER TABLE seats ADD CONSTRAINT seats_current_order_fk
+  FOREIGN KEY (current_order_id, id, event_id)
+  REFERENCES orders(id, seat_id, event_id);
+CREATE UNIQUE INDEX one_live_order_per_seat ON orders(seat_id)
+  WHERE status IN ('HELD','PAYMENT_PENDING','PAID');
+CREATE UNIQUE INDEX one_live_order_per_user_event ON orders(user_id, event_id)
+  WHERE status IN ('HELD','PAYMENT_PENDING','PAID');
+CREATE INDEX orders_user_history ON orders(user_id, created_at DESC);
+CREATE INDEX seats_event_expiry ON seats(event_id, state, hold_expires_at);
+CREATE TABLE payments (
+  id TEXT PRIMARY KEY,
+  order_id TEXT NOT NULL UNIQUE REFERENCES orders(id),
+  provider_reference TEXT UNIQUE,
+  status TEXT NOT NULL CHECK (status IN
+    ('NEW','PENDING','SUCCEEDED','CANCELLED','FAILED','REFUND_PENDING','REFUNDED')),
+  amount_minor BIGINT NOT NULL CHECK (amount_minor >= 0),
+  currency CHAR(3) NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE TABLE tickets (
+  id TEXT PRIMARY KEY,
+  order_id TEXT NOT NULL UNIQUE REFERENCES orders(id),
+  seat_id BIGINT NOT NULL UNIQUE REFERENCES seats(id),
+  user_id BIGINT NOT NULL REFERENCES users(id),
+  qr_token_hash TEXT NOT NULL UNIQUE,
+  issued_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  FOREIGN KEY (order_id, seat_id, user_id) REFERENCES orders(id, seat_id, user_id)
+);
+CREATE TABLE webhook_events (
+  provider_event_id TEXT PRIMARY KEY,
+  payload JSONB NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  processed_at TIMESTAMPTZ
+);
+CREATE TABLE outbox (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  order_id TEXT NOT NULL REFERENCES orders(id),
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  published_at TIMESTAMPTZ
+);
 ```
 
-Also index `orders(user_id, created_at DESC)` for history and
-`seats(event_id, state, hold_expires_at)` for availability/expiry work. Indexes
-cost storage and write work; measure before adding more. PostgreSQL documents
-[uniqueness and foreign-key enforcement](https://www.postgresql.org/docs/current/ddl-constraints.html).
+The event/seat composite FK prevents an order naming a seat from another event.
+The reverse FK ensures a seat's current order names that same seat/event; adding
+it after orders exists resolves the circular table-creation dependency. The
+composite ticket FK checks the ticket's buyer and seat against its order. Default
+NO ACTION deletion behavior retains financial history rather than cascading it
+away. Prices and the original hold response are immutable through the API.
 
-### Hold transaction: Judith and Peter cannot both win seat 42
+The two partial unique indexes enforce one live order per seat and per
+account/event. FAILED, EXPIRED and CANCELLED attempts remain as history but do
+not reserve inventory. Held deadlines remain on orders for idempotent replay;
+PAYMENT_PENDING clears the seat deadline and cannot be freed just by a timer.
+Index history/expiry reads as shown, but measure index cost. PostgreSQL describes
+[constraint enforcement](https://www.postgresql.org/docs/current/ddl-constraints.html).
 
-1. Validate login, admission, sale opening time and request fields. Check the
-   user's idempotency key; retries return the same order, not another hold.
-2. Begin a short SQL transaction and lock the seat using `SELECT ... FOR UPDATE`
-   **on the primary**. All inventory paths lock the seat first, then its order,
-   so acquisition, expiry, cancellation and payment completion use one ordering.
-3. Read a fresh database clock **after acquiring the lock** and recheck that
-   the sale is open. If the seat is AVAILABLE, continue. If HELD and expired,
-   mark its previous order EXPIRED and clear that claim in this transaction.
-   Never reclaim PAYMENT_PENDING merely because the original deadline passed.
-4. Create the HELD order, claim the seat and set a five-minute expiry atomically.
-   Commit both changes, or roll everything back if any constraint/check fails.
-   A concurrent duplicate request-key conflict must roll back and read the
-   existing matching result; a changed request body returns 409.
-5. If Judith commits first, Peter sees her claim after his lock wait and gets
-   409. If Judith rolls back, Peter can proceed. Even faulty code cannot insert
-   two live orders for the seat or two tickets with the same seat ID. Retry
-   deadlock/lock-timeout errors only within a bounded policy using the same key.
+### 4.2 Exact hold transaction
 
-Do not perform an unlocked "check available, then insert" sequence. Do not use
-Redis locks, app memory or a lagging read replica as the booking authority.
-The mechanism relies on database transaction/locking behavior described in
-[PostgreSQL's concurrency documentation](https://www.postgresql.org/docs/current/transaction-iso.html).
+This is executable PL/pgSQL, not a placeholder locking instruction. Install it
+once after the schema. Only a trusted backend role may execute it: the API must
+validate authentication, admission and rate limits, derive `p_user_id` from the
+login, generate `p_order_id`, and hash the canonical request on the server.
+Clients never receive database credentials. Grant the backend role EXECUTE
+explicitly in deployment; the function is SECURITY INVOKER, not a privilege bypass.
+
+```sql
+CREATE OR REPLACE FUNCTION tickethub_hold_seat(
+  p_user_id BIGINT, p_event_id BIGINT, p_seat_id BIGINT,
+  p_order_id TEXT, p_request_key TEXT, p_request_hash TEXT
+) RETURNS JSONB LANGUAGE plpgsql AS $$
+DECLARE
+  v_seat seats%ROWTYPE;
+  v_existing orders%ROWTYPE;
+  v_now TIMESTAMPTZ;
+  v_expires TIMESTAMPTZ;
+  v_response JSONB;
+BEGIN
+  -- The API supplies authenticated user ID, generated order ID and canonical hash.
+  IF p_request_key IS NULL OR btrim(p_request_key) = '' OR
+     p_request_hash IS NULL OR btrim(p_request_hash) = '' THEN
+    RAISE EXCEPTION 'INVALID_REQUEST_KEY' USING ERRCODE = '22023';
+  END IF;
+  SELECT * INTO v_existing FROM orders
+    WHERE user_id = p_user_id AND request_key = p_request_key;
+  IF FOUND THEN
+    IF v_existing.request_hash <> p_request_hash OR
+       v_existing.seat_id <> p_seat_id OR v_existing.event_id <> p_event_id THEN
+      RAISE EXCEPTION 'IDEMPOTENCY_KEY_REUSED' USING ERRCODE = 'P0001';
+    END IF;
+    RETURN v_existing.initial_response;
+  END IF;
+
+  -- The crucial lock: another transaction cannot claim this row until we finish.
+  SELECT * INTO v_seat FROM seats
+    WHERE id = p_seat_id AND event_id = p_event_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'SEAT_NOT_FOUND' USING ERRCODE = 'P0002';
+  END IF;
+  -- A same-key concurrent call might have completed while this call waited.
+  SELECT * INTO v_existing FROM orders
+    WHERE user_id = p_user_id AND request_key = p_request_key;
+  IF FOUND THEN
+    IF v_existing.request_hash <> p_request_hash OR
+       v_existing.seat_id <> p_seat_id OR v_existing.event_id <> p_event_id THEN
+      RAISE EXCEPTION 'IDEMPOTENCY_KEY_REUSED' USING ERRCODE = 'P0001';
+    END IF;
+    RETURN v_existing.initial_response;
+  END IF;
+
+  v_now := clock_timestamp(); -- Fresh after waiting for the seat lock.
+  PERFORM 1 FROM events WHERE id = p_event_id AND status = 'OPEN'
+    AND sale_opens_at <= v_now AND starts_at > v_now;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'SALE_NOT_OPEN' USING ERRCODE = 'P0001';
+  END IF;
+  IF v_seat.state = 'HELD' AND v_seat.hold_expires_at <= v_now THEN
+    UPDATE orders SET status = 'EXPIRED'
+      WHERE id = v_seat.current_order_id AND status = 'HELD';
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'CLAIM_STATE_MISMATCH' USING ERRCODE = 'P0001';
+    END IF;
+    UPDATE seats SET state = 'AVAILABLE', current_order_id = NULL,
+      hold_expires_at = NULL WHERE id = p_seat_id;
+    v_seat.state := 'AVAILABLE';
+  END IF;
+  IF v_seat.state <> 'AVAILABLE' THEN
+    RAISE EXCEPTION 'SEAT_UNAVAILABLE' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_expires := v_now + INTERVAL '5 minutes';
+  v_response := jsonb_build_object('orderId', p_order_id, 'seatId', p_seat_id,
+    'status', 'HELD', 'expiresAt', v_expires,
+    'amountMinor', v_seat.price_minor, 'currency', btrim(v_seat.currency));
+  INSERT INTO orders(id, user_id, event_id, seat_id, status, amount_minor,
+      currency, request_key, request_hash, hold_expires_at, initial_response)
+    VALUES(p_order_id, p_user_id, p_event_id, p_seat_id, 'HELD', v_seat.price_minor,
+      v_seat.currency, p_request_key, p_request_hash, v_expires, v_response);
+  UPDATE seats SET state = 'HELD', current_order_id = p_order_id,
+    hold_expires_at = v_expires WHERE id = p_seat_id;
+  RETURN v_response;
+EXCEPTION WHEN unique_violation THEN
+  -- PostgreSQL rolls back this function block's changes before this handler.
+  SELECT * INTO v_existing FROM orders
+    WHERE user_id = p_user_id AND request_key = p_request_key;
+  IF FOUND AND v_existing.request_hash = p_request_hash AND
+      v_existing.seat_id = p_seat_id AND v_existing.event_id = p_event_id THEN
+    RETURN v_existing.initial_response;
+  END IF;
+  RAISE; -- Purchase-limit or other uniqueness conflict: API returns 409.
+END;
+$$;
+REVOKE ALL ON FUNCTION tickethub_hold_seat(BIGINT,BIGINT,BIGINT,TEXT,TEXT,TEXT)
+  FROM PUBLIC;
+```
+
+In a fresh test database, run this fixture after the schema and function:
+
+```sql
+INSERT INTO users(id, name, email, auth_subject) VALUES
+  (1, 'Judith Kerubo', 'judith.kerubo@example.com', 'demo-judith'),
+  (2, 'Peter Onyango', 'peter.onyango@example.com', 'demo-peter');
+INSERT INTO events(id, title, venue, starts_at, sale_opens_at, status) VALUES
+  (7, 'Demo concert', 'Demo venue', clock_timestamp() + INTERVAL '2 days',
+   clock_timestamp() - INTERVAL '1 day', 'OPEN');
+INSERT INTO seats(id, event_id, section, seat_number, price_minor, currency, state)
+  VALUES (42, 7, 'A', '42', 300000, 'KES', 'AVAILABLE');
+```
+
+
+The application calls it on **one primary-database connection**, with bound
+parameters, and sends 201 only after COMMIT succeeds. For a worked example,
+assume users 1 (Judith Kerubo) and 2 (Peter Onyango), open event 7 and available
+seat 42 already exist. The example hash is illustrative; the API computes a
+real canonical-request hash in production.
+
+```sql
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SET LOCAL lock_timeout = '2s';
+SELECT tickethub_hold_seat(
+  1, 7, 42, 'order-judith-001', 'request-judith-001', 'demo-hash-event7-seat42'
+);
+-- In a two-session test, pause here before committing.
+COMMIT;
+```
+
+While session A is paused, run this in a **separate PostgreSQL connection**:
+
+```sql
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SET LOCAL lock_timeout = '2s';
+SELECT tickethub_hold_seat(
+  2, 7, 42, 'order-peter-001', 'request-peter-001', 'demo-hash-event7-seat42'
+);
+-- It waits for A; after A commits it raises SEAT_UNAVAILABLE.
+-- If A stays open longer than two seconds, this attempt hits the lock timeout.
+ROLLBACK;
+```
+
+The API must ROLLBACK on any error before reusing the connection. Map
+`SEAT_UNAVAILABLE`, `IDEMPOTENCY_KEY_REUSED` and purchase-limit unique violations
+to 409; map `SEAT_NOT_FOUND` to 404. A lock timeout is a bounded retry/503 case,
+not proof that the other buyer failed. Reuse the same request key on retries.
+The function's unique-violation handler rolls back its tentative changes and
+returns an existing result only when that user's key, event, seat and hash match.
+
+### Why two buyers cannot both win
+
+Judith locks seat 42 first. Peter must wait or time out; he cannot update a
+second copy of that row. After Judith commits, Peter reads her HELD claim and
+is rejected. If Judith rolls back, Peter can claim it. Order creation and the
+seat update succeed together or roll back together, including expired-claim
+replacement. PAYMENT_PENDING and SOLD are never reclaimed by this function.
+
+The partial unique index independently prevents two live orders for one seat;
+`tickets.seat_id UNIQUE` prevents two issued tickets. All expiry/payment paths
+must lock the same seat first and then its order. Do not use an unlocked
+check-then-insert, Redis or a read replica as the booking authority. See
+[PostgreSQL row locking](https://www.postgresql.org/docs/current/explicit-locking.html)
+and [PL/pgSQL result/error handling](https://www.postgresql.org/docs/current/plpgsql-statements.html).
+
 
 ### Payment, expiry and retry lifecycle
 
@@ -268,6 +487,8 @@ supports signature checks and duplicate-event handling.
 | Read replica | Serves suitable browsing/history reads without deciding holds or payment completion. |
 | Durable queue and workers | Deliver receipts, reconcile payments and schedule expiry without blocking checkout requests. |
 | Payment provider | Securely collects card payment and reports its independently verified outcome. |
+
+### 5.1 Architecture diagram
 
 ```text
 Client --DNS lookup--> Managed DNS
@@ -345,6 +566,12 @@ key (one order); fail one transaction (no partial claim); expire an old hold aft
 replacement (new owner unaffected); race expiry with payment start (one legal
 state wins); deliver duplicate/out-of-order callbacks (one ticket); time out the
 provider (retain uncertainty); retry a late payment (refund, no seat theft).
+The revised schema and hold function were executed from these Markdown SQL
+blocks in embedded PostgreSQL (PGlite). Checks passed for foreign keys,
+idempotent replay, purchase limits, expiry replacement, rollback, pending-payment
+protection, sold-seat rejection and ticket uniqueness. That engine exposes one
+session, so the separate-connection blocking exercise above still needs a
+PostgreSQL server; it is not claimed as a completed concurrency/load test.
 Also load-test the admission cap and burst, simulate queue/cache/zone failures,
 and restore a backup. These are required validation steps, not claimed production
 load-test results. The design is complete through this final section.
